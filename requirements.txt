@@ -1,4 +1,4 @@
-iqoptionapi
+git+https://github.com/iqoptionapi/iqoptionapi.git
 websocket-client
 requests
 flask

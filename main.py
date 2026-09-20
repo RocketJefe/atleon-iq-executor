@@ -38,7 +38,12 @@ def inicializar_iq():
         print(f"❌ [ERROR IQ] Falla: {motivo}")
         return None
 
-    api.change_balance(IQ_ACCOUNT_TYPE)
+    # Método nativo sin guion bajo
+    try:
+        api.changebalance(IQ_ACCOUNT_TYPE)
+    except Exception:
+        pass
+
     saldo = api.get_balance()
     print(f"✅ [IQ CONECTADO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${saldo:.2f}")
     return api
@@ -59,7 +64,7 @@ def extraer_datos_senal(texto):
 
 # ================= BUCLE PRINCIPAL =================
 def main():
-    # Iniciar servidor HTTP en segundo plano para Render Free
+    # Iniciar servidor HTTP en segundo plano
     Thread(target=iniciar_servidor_web, daemon=True).start()
 
     if not IQ_USER or not IQ_PASS:

@@ -2,7 +2,6 @@ import os
 import time
 import re
 import requests
-import concurrent.futures
 from threading import Thread
 from flask import Flask
 from iqoptionapi.stable_api import IQ_Option
@@ -44,7 +43,7 @@ def inicializar_iq():
     print(f"✅ [IQ CONECTADO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${saldo}")
     return api
 
-# ================= PARSER DE SEÑALES =================
+# ================= PARSER DE ATLEON TERMINAL =================
 def parsear_mensaje(texto):
     texto_upper = texto.upper()
 
@@ -58,7 +57,7 @@ def parsear_mensaje(texto):
     if not direccion:
         return None, None, None
 
-    # 2. Activo: Soporta formato estructurado de radar o texto manual
+    # 2. Activo (compatible con el formato del radar 'Activo: GBPUSD-OTC' o manual)
     activo = DEFAULT_ACTIVE
     match_radar = re.search(r"ACTIVO:\s*([A-Z0-9_\-]+)", texto_upper)
     if match_radar:
@@ -69,57 +68,42 @@ def parsear_mensaje(texto):
         if par_match and par_match.group(1) not in palabras_ignorar:
             activo = par_match.group(1)
 
-    # 3. Duración (30s, 60s, 5s)
+    # 3. Duración (30s, 60s, etc.)
     duracion = DEFAULT_DURATION
     if re.search(r"\b(30\s*(?:S|SEG)?)\b", texto_upper):
         duracion = 30
-    elif re.search(r"\b(5\s*(?:S|SEG)?)\b", texto_upper):
-        duracion = 5
-    elif re.search(r"\b(15\s*(?:S|SEG)?)\b", texto_upper):
-        duracion = 15
     elif re.search(r"\b(60\s*(?:S|SEG)?|1\s*(?:M|MIN)?)\b", texto_upper):
         duracion = 60
+    elif re.search(r"\b(5\s*(?:S|SEG)?)\b", texto_upper):
+        duracion = 5
 
     return direccion, activo, duracion
 
-# ================= EJECUCIÓN CON TIMEOUT (ANTI-CONGELAMIENTO) =================
-def orden_interna(api, activo, direccion, duracion):
-    # Si se pide Blitz (5s, 15s, 30s)
-    if duracion in [5, 15, 30]:
-        try:
-            ok, res = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, duracion)
-            if ok and res:
-                return True, res, f"Blitz {duracion}s"
-        except Exception:
-            pass
-
-    # Modo estándar / Fallback: Binaria 1m (60s)
+# ================= EJECUCIÓN DIRECTA SIN BLOQUEO =================
+def disparar_operacion(api, activo, direccion, duracion):
+    """
+    Ejecuta con prioridad en binarias/turbo evitando llamadas que congelen el socket.
+    """
+    # En IQ Option, tanto 30s como 60s en pares OTC se colocan vía Turbo (expiración 1 minuto)
+    # o Digital Spot si el activo es compatible.
     try:
-        ok, res = api.buy(TRADE_AMOUNT, activo, direccion, 1)
-        if ok and res:
-            return True, res, "Binaria 60s"
-    except Exception:
-        pass
+        if duracion in [5, 15, 30]:
+            # Intento Digital/Blitz
+            check, id_trade = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, 1)
+            if check and id_trade:
+                return True, id_trade, f"Blitz/Digital {duracion}s"
+    except Exception as e:
+        print(f"[BLITZ ERR]: {e}")
 
-    # Segundo fallback: Digital 1m
+    # Ejecución principal de alta fiabilidad (Binaria Turbo)
     try:
-        ok, res = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, 1)
-        if ok and res:
-            return True, res, "Digital 60s"
+        check, id_trade = api.buy(TRADE_AMOUNT, activo, direccion, 1)
+        if check and id_trade:
+            return True, id_trade, "Binaria"
+        else:
+            return False, str(id_trade), "Error"
     except Exception as e:
         return False, str(e), "Error"
-
-    return False, "Activo cerrado o no disponible", "Error"
-
-def disparar_con_timeout(api, activo, direccion, duracion):
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(orden_interna, api, activo, direccion, duracion)
-    try:
-        return future.result(timeout=4)  # Máximo 4 segundos de espera
-    except concurrent.futures.TimeoutError:
-        return False, "Tiempo de espera agotado en broker (Timeout)", "Timeout"
-    finally:
-        executor.shutdown(wait=False)
 
 # ================= BUCLE PRINCIPAL =================
 def main():
@@ -139,7 +123,7 @@ def main():
         pass
 
     print("\n" + "=" * 55)
-    print("  🚀 ATLEON IQ EXECUTOR V4 (ANTIBLOQUEO ACTIVO) 🚀")
+    print("  🚀 ATLEON IQ EXECUTOR V5 (SIN TIMEOUT LATE) 🚀")
     print("=" * 55 + "\n")
 
     last_update_id = 0
@@ -165,13 +149,13 @@ def main():
 
                 chat_id = msg["chat"]["id"]
                 texto = msg["text"].strip()
-                print(f"\n[MENSAJE DETECTADO]:\n{texto}")
+                print(f"\n[MENSAJE RECIBIDO]:\n{texto}")
 
                 if texto.upper().startswith("/STATUS"):
                     saldo = api.get_balance()
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"📊 Atleon IQ Conectado:\n• Saldo: ${saldo:.2f}\n• Cuenta: {IQ_ACCOUNT_TYPE}\n• Listo para operar 24/7"
+                        "text": f"📊 Atleon IQ Conectado:\n• Saldo: ${saldo:.2f}\n• Cuenta: {IQ_ACCOUNT_TYPE}\n• Listo para operar"
                     }, timeout=5)
                     continue
 
@@ -179,18 +163,18 @@ def main():
                 if not direccion:
                     continue
 
-                print(f"⚡ [DISPARO] {activo} | {direccion.upper()} | {duracion}s")
-                exito, resultado, modo = disparar_con_timeout(api, activo, direccion, duracion)
+                print(f"⚡ [DISPARO] {activo} | {direccion.upper()} | {duracion}s | ${TRADE_AMOUNT}")
+                exito, resultado, modo = disparar_operacion(api, activo, direccion, duracion)
 
                 if exito:
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"✅ Trade Ejecutado ({modo}):\n• Par: {activo}\n• Tipo: {direccion.upper()}\n• Monto: ${TRADE_AMOUNT}"
+                        "text": f"✅ Trade Ejecutado ({modo}):\n• Par: {activo}\n• Dirección: {direccion.upper()}\n• Monto: ${TRADE_AMOUNT}"
                     }, timeout=5)
                 else:
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"⚠️ Fallo al abrir {activo} ({duracion}s): {resultado}"
+                        "text": f"⚠️ No se ejecutó en {activo}: {resultado}"
                     }, timeout=5)
 
         except Exception as e:

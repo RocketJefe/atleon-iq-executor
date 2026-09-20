@@ -4,7 +4,7 @@ import re
 import requests
 from threading import Thread
 from flask import Flask
-from iqoptionapi.api import IQOptionAPI
+from iqoptionapi.stable_api import IQ_Option
 
 # ================= SERVIDOR WEB (RENDER FREE TIER) =================
 app = Flask(__name__)
@@ -31,21 +31,16 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # ================= CONEXIÓN IQ OPTION =================
 def inicializar_iq():
     print(f"\n[IQ] Conectando con {IQ_USER}...")
-    api = IQOptionAPI("iqoption.com", IQ_USER, IQ_PASS)
+    api = IQ_Option(IQ_USER, IQ_PASS)
     conectado, motivo = api.connect()
 
     if not conectado:
         print(f"❌ [ERROR IQ] Falla: {motivo}")
         return None
 
-    # Método nativo sin guion bajo
-    try:
-        api.changebalance(IQ_ACCOUNT_TYPE)
-    except Exception:
-        pass
-
+    api.change_balance(IQ_ACCOUNT_TYPE)
     saldo = api.get_balance()
-    print(f"✅ [IQ CONECTADO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${saldo:.2f}")
+    print(f"✅ [IQ CONECTADO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${saldo}")
     return api
 
 def extraer_datos_senal(texto):
@@ -64,7 +59,6 @@ def extraer_datos_senal(texto):
 
 # ================= BUCLE PRINCIPAL =================
 def main():
-    # Iniciar servidor HTTP en segundo plano
     Thread(target=iniciar_servidor_web, daemon=True).start()
 
     if not IQ_USER or not IQ_PASS:
@@ -114,7 +108,7 @@ def main():
                     saldo = api.get_balance()
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"📊 IQ Option Cloud:\n• Estado: 🟢 Conectado\n• Cuenta: {IQ_ACCOUNT_TYPE}\n• Saldo: ${saldo:.2f}"
+                        "text": f"📊 IQ Option Cloud:\n• Estado: 🟢 Conectado\n• Cuenta: {IQ_ACCOUNT_TYPE}\n• Saldo: ${saldo}"
                     }, timeout=5)
                     continue
 

@@ -1,3 +1,4 @@
 iqoptionapi
+websocket-client
 requests
 flask

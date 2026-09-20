@@ -2,6 +2,7 @@ import os
 import time
 import re
 import requests
+import concurrent.futures
 from threading import Thread
 from flask import Flask
 from iqoptionapi.stable_api import IQ_Option
@@ -11,7 +12,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def health_check():
-    return "OK - Atleon IQ Blitz & 60s Executor Activo", 200
+    return "OK - Atleon IQ Executor Activo", 200
 
 def iniciar_servidor_web():
     puerto = int(os.environ.get("PORT", 10000))
@@ -28,6 +29,7 @@ DEFAULT_DURATION = int(os.getenv("DEFAULT_DURATION", "60"))
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# ================= CONEXIÓN IQ OPTION =================
 def inicializar_iq():
     print(f"\n[IQ] Conectando con {IQ_USER}...")
     api = IQ_Option(IQ_USER, IQ_PASS)
@@ -42,78 +44,82 @@ def inicializar_iq():
     print(f"✅ [IQ CONECTADO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${saldo}")
     return api
 
-def extraer_datos_senal(texto):
+# ================= PARSER DE SEÑALES =================
+def parsear_mensaje(texto):
     texto_upper = texto.upper()
-    
+
     # 1. Dirección
-    es_call = any(k in texto_upper for k in ["COMPRA", "CALL", "SUBE", "HIGHER"])
-    es_put = any(k in texto_upper for k in ["VENTA", "PUT", "BAJA", "LOWER"])
-    
-    if not (es_call or es_put):
+    direccion = None
+    if any(k in texto_upper for k in ["COMPRA", "CALL", "SUBE", "HIGHER"]):
+        direccion = "call"
+    elif any(k in texto_upper for k in ["VENTA", "PUT", "BAJA", "LOWER"]):
+        direccion = "put"
+
+    if not direccion:
         return None, None, None
 
-    direccion = "call" if es_call else "put"
-    
-    # 2. Duración
+    # 2. Activo: Soporta formato estructurado de radar o texto manual
+    activo = DEFAULT_ACTIVE
+    match_radar = re.search(r"ACTIVO:\s*([A-Z0-9_\-]+)", texto_upper)
+    if match_radar:
+        activo = match_radar.group(1).strip()
+    else:
+        par_match = re.search(r"\b([A-Z0-9]{2,10}(?:-OTC)?)\b", texto_upper.replace("/", ""))
+        palabras_ignorar = ["CALL", "PUT", "SUBE", "BAJA", "STATUS", "BLITZ", "COMPRA", "VENTA", "HORA", "PRECIO", "SENAL", "30S", "60S", "5S", "15S", "1M"]
+        if par_match and par_match.group(1) not in palabras_ignorar:
+            activo = par_match.group(1)
+
+    # 3. Duración (30s, 60s, 5s)
     duracion = DEFAULT_DURATION
-    if re.search(r"\b5\s*(?:S|SEG)?\b", texto_upper):
-        duracion = 5
-    elif re.search(r"\b15\s*(?:S|SEG)?\b", texto_upper):
-        duracion = 15
-    elif re.search(r"\b30\s*(?:S|SEG)?\b", texto_upper):
+    if re.search(r"\b(30\s*(?:S|SEG)?)\b", texto_upper):
         duracion = 30
+    elif re.search(r"\b(5\s*(?:S|SEG)?)\b", texto_upper):
+        duracion = 5
+    elif re.search(r"\b(15\s*(?:S|SEG)?)\b", texto_upper):
+        duracion = 15
     elif re.search(r"\b(60\s*(?:S|SEG)?|1\s*(?:M|MIN)?)\b", texto_upper):
         duracion = 60
 
-    # 3. Activo
-    # Limpiar palabras clave para aislar el activo
-    limpio = texto_upper
-    for palabra in ["COMPRA", "CALL", "SUBE", "HIGHER", "VENTA", "PUT", "BAJA", "LOWER", 
-                    "BLITZ", "5S", "15S", "30S", "60S", "1M", "SEG", "SEGUNDOS"]:
-        limpio = re.sub(rf"\b{palabra}\b", "", limpio)
-    
-    tokens = [t.strip() for t in re.split(r"[\s/]+", limpio) if len(t.strip()) >= 2]
-    
-    activo = DEFAULT_ACTIVE
-    if tokens:
-        # Tomar el primer token representativo (ej: GER30, EURUSD-OTC, TRUMP)
-        activo = tokens[0]
-
     return direccion, activo, duracion
 
-def ejecutar_orden(api, activo, direccion, duracion):
-    """
-    Intenta ejecutar la orden con timeout y reporte directo de error.
-    """
-    # Manejo de Blitz (5s, 15s, 30s)
+# ================= EJECUCIÓN CON TIMEOUT (ANTI-CONGELAMIENTO) =================
+def orden_interna(api, activo, direccion, duracion):
+    # Si se pide Blitz (5s, 15s, 30s)
     if duracion in [5, 15, 30]:
         try:
-            check, id_trade = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, duracion)
-            if check and id_trade:
-                return True, id_trade, f"Blitz {duracion}s"
-        except Exception as e:
-            print(f"[BLITZ SPOT ERROR]: {e}")
+            ok, res = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, duracion)
+            if ok and res:
+                return True, res, f"Blitz {duracion}s"
+        except Exception:
+            pass
 
-        # Si el activo tiene sufijo -OTC o formato binario y falla en Blitz, avisar
-        return False, f"El par {activo} no admite Blitz de {duracion}s en este momento.", "Error"
-
-    # Manejo estándar de 60 segundos
+    # Modo estándar / Fallback: Binaria 1m (60s)
     try:
-        check, id_trade = api.buy(TRADE_AMOUNT, activo, direccion, 1)
-        if check and id_trade:
-            return True, id_trade, "Binaria 60s (1m)"
-    except Exception as e:
-        print(f"[BINARIA ERROR]: {e}")
-
-    # Fallback Digital 1m
-    try:
-        check, id_trade = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, 1)
-        if check and id_trade:
-            return True, id_trade, "Digital 60s (1m)"
+        ok, res = api.buy(TRADE_AMOUNT, activo, direccion, 1)
+        if ok and res:
+            return True, res, "Binaria 60s"
     except Exception:
         pass
 
-    return False, f"No se pudo abrir orden en {activo}", "Error"
+    # Segundo fallback: Digital 1m
+    try:
+        ok, res = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, 1)
+        if ok and res:
+            return True, res, "Digital 60s"
+    except Exception as e:
+        return False, str(e), "Error"
+
+    return False, "Activo cerrado o no disponible", "Error"
+
+def disparar_con_timeout(api, activo, direccion, duracion):
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(orden_interna, api, activo, direccion, duracion)
+    try:
+        return future.result(timeout=4)  # Máximo 4 segundos de espera
+    except concurrent.futures.TimeoutError:
+        return False, "Tiempo de espera agotado en broker (Timeout)", "Timeout"
+    finally:
+        executor.shutdown(wait=False)
 
 # ================= BUCLE PRINCIPAL =================
 def main():
@@ -133,7 +139,7 @@ def main():
         pass
 
     print("\n" + "=" * 55)
-    print("  🚀 ATLEON IQ EXECUTOR V3 (BLITZ + 60S LISTO) 🚀")
+    print("  🚀 ATLEON IQ EXECUTOR V4 (ANTIBLOQUEO ACTIVO) 🚀")
     print("=" * 55 + "\n")
 
     last_update_id = 0
@@ -141,7 +147,7 @@ def main():
     while True:
         try:
             if not api.check_connect():
-                print("[RECONEXIÓN] Conectando sesión...")
+                print("[RECONEXIÓN] Reconectando sesión...")
                 api.connect()
 
             url = f"{TG_API}/getUpdates?offset={last_update_id + 1}&timeout=10"
@@ -159,37 +165,32 @@ def main():
 
                 chat_id = msg["chat"]["id"]
                 texto = msg["text"].strip()
-                print(f"\n[TELEGRAM]: {texto}")
+                print(f"\n[MENSAJE DETECTADO]:\n{texto}")
 
                 if texto.upper().startswith("/STATUS"):
                     saldo = api.get_balance()
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"📊 Atleon IQ Cloud:\n• Estado: 🟢 Conectado\n• Saldo: ${saldo:.2f}\n• Listo para: Blitz (5s/15s/30s) y 60s"
+                        "text": f"📊 Atleon IQ Conectado:\n• Saldo: ${saldo:.2f}\n• Cuenta: {IQ_ACCOUNT_TYPE}\n• Listo para operar 24/7"
                     }, timeout=5)
                     continue
 
-                direccion, activo, duracion = extraer_datos_senal(texto)
+                direccion, activo, duracion = parsear_mensaje(texto)
                 if not direccion:
-                    # Si no detectó dirección, notificar al usuario para no quedar en silencio
-                    requests.post(f"{TG_API}/sendMessage", json={
-                        "chat_id": chat_id,
-                        "text": f"⚠️ Mensaje recibido sin dirección clara (SUBE/BAJA/CALL/PUT): '{texto}'"
-                    }, timeout=5)
                     continue
 
-                print(f"⚡ [DISPARO] {direccion.upper()} | {activo} | {duracion}s | ${TRADE_AMOUNT}")
-                exito, resultado, modo = ejecutar_orden(api, activo, direccion, duracion)
+                print(f"⚡ [DISPARO] {activo} | {direccion.upper()} | {duracion}s")
+                exito, resultado, modo = disparar_con_timeout(api, activo, direccion, duracion)
 
                 if exito:
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"✅ Trade Ejecutado ({modo}):\n• Activo: {activo}\n• Dirección: {direccion.upper()}\n• Tiempo: {duracion}s\n• Monto: ${TRADE_AMOUNT}"
+                        "text": f"✅ Trade Ejecutado ({modo}):\n• Par: {activo}\n• Tipo: {direccion.upper()}\n• Monto: ${TRADE_AMOUNT}"
                     }, timeout=5)
                 else:
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"❌ Error en orden ({duracion}s): {resultado}"
+                        "text": f"⚠️ Fallo al abrir {activo} ({duracion}s): {resultado}"
                     }, timeout=5)
 
         except Exception as e:

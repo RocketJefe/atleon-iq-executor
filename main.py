@@ -28,26 +28,32 @@ DEFAULT_DURATION = int(os.getenv("DEFAULT_DURATION", "60"))
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ================= CONEXIÓN IQ OPTION =================
-def inicializar_iq():
-    print(f"\n[IQ] Conectando con {IQ_USER}...")
-    api = IQ_Option(IQ_USER, IQ_PASS)
-    conectado, motivo = api.connect()
+api = None
+conectado_iq = False
 
-    if not conectado:
-        print(f"❌ [ERROR IQ] Falla: {motivo}")
-        return None
-
-    api.change_balance(IQ_ACCOUNT_TYPE)
-    saldo = api.get_balance()
-    print(f"✅ [IQ CONECTADO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${saldo}")
-    return api
+# ================= GESTOR DE CONEXIÓN IQ OPTION =================
+def conectar_iq_seguro():
+    global api, conectado_iq
+    try:
+        print(f"[IQ] Intentando conexión con {IQ_USER}...")
+        instancia = IQ_Option(IQ_USER, IQ_PASS)
+        check, reason = instancia.connect()
+        if check:
+            instancia.change_balance(IQ_ACCOUNT_TYPE)
+            api = instancia
+            conectado_iq = True
+            print(f"✅ [IQ CONECTADO EXITOSO] Saldo: ${api.get_balance()}")
+        else:
+            print(f"❌ [IQ FALLO]: {reason}")
+            conectado_iq = False
+    except Exception as e:
+        print(f"❌ [IQ EXCEPCION]: {e}")
+        conectado_iq = False
 
 # ================= PARSER DE ATLEON TERMINAL =================
 def parsear_mensaje(texto):
     texto_upper = texto.upper()
 
-    # 1. Dirección
     direccion = None
     if any(k in texto_upper for k in ["COMPRA", "CALL", "SUBE", "HIGHER"]):
         direccion = "call"
@@ -57,7 +63,6 @@ def parsear_mensaje(texto):
     if not direccion:
         return None, None, None
 
-    # 2. Activo (compatible con el formato del radar 'Activo: GBPUSD-OTC' o manual)
     activo = DEFAULT_ACTIVE
     match_radar = re.search(r"ACTIVO:\s*([A-Z0-9_\-]+)", texto_upper)
     if match_radar:
@@ -68,7 +73,6 @@ def parsear_mensaje(texto):
         if par_match and par_match.group(1) not in palabras_ignorar:
             activo = par_match.group(1)
 
-    # 3. Duración (30s, 60s, etc.)
     duracion = DEFAULT_DURATION
     if re.search(r"\b(30\s*(?:S|SEG)?)\b", texto_upper):
         duracion = 30
@@ -79,63 +83,46 @@ def parsear_mensaje(texto):
 
     return direccion, activo, duracion
 
-# ================= EJECUCIÓN DIRECTA SIN BLOQUEO =================
-def disparar_operacion(api, activo, direccion, duracion):
-    """
-    Ejecuta con prioridad en binarias/turbo evitando llamadas que congelen el socket.
-    """
-    # En IQ Option, tanto 30s como 60s en pares OTC se colocan vía Turbo (expiración 1 minuto)
-    # o Digital Spot si el activo es compatible.
-    try:
-        if duracion in [5, 15, 30]:
-            # Intento Digital/Blitz
-            check, id_trade = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, 1)
-            if check and id_trade:
-                return True, id_trade, f"Blitz/Digital {duracion}s"
-    except Exception as e:
-        print(f"[BLITZ ERR]: {e}")
+# ================= EJECUCIÓN DIRECTA =================
+def ejecutar_trade(activo, direccion, duracion):
+    global api
+    if not api or not conectado_iq:
+        return False, "Sesión de broker no lista", "Desconectado"
 
-    # Ejecución principal de alta fiabilidad (Binaria Turbo)
+    # 1. Intento Digital / Blitz
+    if duracion in [5, 15, 30]:
+        try:
+            ok, res_id = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, 1)
+            if ok and res_id:
+                return True, res_id, f"Blitz {duracion}s"
+        except Exception:
+            pass
+
+    # 2. Operación Turbo / Binaria (Estándar 60s)
     try:
-        check, id_trade = api.buy(TRADE_AMOUNT, activo, direccion, 1)
-        if check and id_trade:
-            return True, id_trade, "Binaria"
+        ok, res_id = api.buy(TRADE_AMOUNT, activo, direccion, 1)
+        if ok and res_id:
+            return True, res_id, "Binaria 60s"
         else:
-            return False, str(id_trade), "Error"
+            return False, str(res_id), "Fallo Broker"
     except Exception as e:
-        return False, str(e), "Error"
+        return False, str(e), "Excepción"
 
-# ================= BUCLE PRINCIPAL =================
-def main():
-    Thread(target=iniciar_servidor_web, daemon=True).start()
-
-    if not IQ_USER or not IQ_PASS:
-        print("❌ Variables de credenciales no configuradas.")
-        return
-
-    api = inicializar_iq()
-    if not api:
-        return
-
+# ================= BUCLE TELEGRAM =================
+def loop_telegram():
+    global api, conectado_iq
     try:
         requests.get(f"{TG_API}/deleteWebhook?drop_pending_updates=True", timeout=5)
     except Exception:
         pass
 
-    print("\n" + "=" * 55)
-    print("  🚀 ATLEON IQ EXECUTOR V5 (SIN TIMEOUT LATE) 🚀")
-    print("=" * 55 + "\n")
-
     last_update_id = 0
+    print("🤖 [TELEGRAM LISTO] Escuchando actualizaciones de comandos y alertas...")
 
     while True:
         try:
-            if not api.check_connect():
-                print("[RECONEXIÓN] Reconectando sesión...")
-                api.connect()
-
-            url = f"{TG_API}/getUpdates?offset={last_update_id + 1}&timeout=10"
-            res = requests.get(url, timeout=15).json()
+            url = f"{TG_API}/getUpdates?offset={last_update_id + 1}&timeout=5"
+            res = requests.get(url, timeout=10).json()
 
             if not res.get("ok"):
                 time.sleep(1)
@@ -149,13 +136,14 @@ def main():
 
                 chat_id = msg["chat"]["id"]
                 texto = msg["text"].strip()
-                print(f"\n[MENSAJE RECIBIDO]:\n{texto}")
+                print(f"[RECEPTOR TG]: {texto}")
 
                 if texto.upper().startswith("/STATUS"):
-                    saldo = api.get_balance()
+                    estado_str = "🟢 Conectado" if conectado_iq else "🔴 Reconectando..."
+                    saldo_str = f"${api.get_balance():.2f}" if (conectado_iq and api) else "Cargando..."
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"📊 Atleon IQ Conectado:\n• Saldo: ${saldo:.2f}\n• Cuenta: {IQ_ACCOUNT_TYPE}\n• Listo para operar"
+                        "text": f"📊 Atleon IQ Cloud:\n• Estado: {estado_str}\n• Cuenta: {IQ_ACCOUNT_TYPE}\n• Saldo: {saldo_str}\n• Ejecución activa 24/7"
                     }, timeout=5)
                     continue
 
@@ -163,25 +151,39 @@ def main():
                 if not direccion:
                     continue
 
-                print(f"⚡ [DISPARO] {activo} | {direccion.upper()} | {duracion}s | ${TRADE_AMOUNT}")
-                exito, resultado, modo = disparar_operacion(api, activo, direccion, duracion)
+                if not conectado_iq:
+                    requests.post(f"{TG_API}/sendMessage", json={
+                        "chat_id": chat_id,
+                        "text": "⚠️ Reconectando con IQ Option, reintenta en un momento..."
+                    }, timeout=5)
+                    Thread(target=conectar_iq_seguro).start()
+                    continue
+
+                print(f"⚡ [DISPARO] {activo} | {direccion.upper()} | {duracion}s")
+                exito, id_orden, modo = ejecutar_trade(activo, direccion, duracion)
 
                 if exito:
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"✅ Trade Ejecutado ({modo}):\n• Par: {activo}\n• Dirección: {direccion.upper()}\n• Monto: ${TRADE_AMOUNT}"
+                        "text": f"✅ Trade Atleon Ejecutado ({modo}):\n• Par: {activo}\n• Señal: {direccion.upper()}\n• Monto: ${TRADE_AMOUNT}"
                     }, timeout=5)
                 else:
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"⚠️ No se ejecutó en {activo}: {resultado}"
+                        "text": f"⚠️ Broker rechazó orden ({activo}): {id_orden}"
                     }, timeout=5)
 
         except Exception as e:
-            print(f"[LOOP EXCEPTION]: {e}")
-            time.sleep(2)
+            print(f"[LOOP TG ERROR]: {e}")
+            time.sleep(1)
 
-        time.sleep(0.2)
+        time.sleep(0.1)
+
+# ================= ENTRADA PRINCIPAL =================
+def main():
+    Thread(target=iniciar_servidor_web, daemon=True).start()
+    conectar_iq_seguro()
+    loop_telegram()
 
 if __name__ == "__main__":
     main()

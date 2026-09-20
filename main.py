@@ -23,13 +23,11 @@ IQ_PASS = os.getenv("IQ_PASS")
 IQ_ACCOUNT_TYPE = os.getenv("IQ_ACCOUNT_TYPE", "PRACTICE").upper()
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "1"))
 DEFAULT_ACTIVE = os.getenv("DEFAULT_ACTIVE", "EURUSD-OTC")
-# Duración por defecto (puedes poner 60 o 5)
-DEFAULT_DURATION = int(os.getenv("DEFAULT_DURATION", "60")) 
+DEFAULT_DURATION = int(os.getenv("DEFAULT_DURATION", "60"))
 
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# ================= CONEXIÓN IQ OPTION =================
 def inicializar_iq():
     print(f"\n[IQ] Conectando con {IQ_USER}...")
     api = IQ_Option(IQ_USER, IQ_PASS)
@@ -44,7 +42,6 @@ def inicializar_iq():
     print(f"✅ [IQ CONECTADO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${saldo}")
     return api
 
-# ================= PARSER INTELIGENTE DE SEÑALES =================
 def extraer_datos_senal(texto):
     texto_upper = texto.upper()
     es_call = any(k in texto_upper for k in ["COMPRA", "CALL", "SUBE", "HIGHER"])
@@ -55,72 +52,74 @@ def extraer_datos_senal(texto):
 
     direccion = "call" if es_call else "put"
     
-    # 1. Detectar duración (5s, 15s, 30s, 60s, 1m, 60 seg)
+    # Detección de duración Blitz (5, 15, 30 segundos) o estándar (60s)
     duracion = DEFAULT_DURATION
-    if re.search(r"\b(60\s*(?:S|SEG|SEGUNDOS)?|1\s*(?:M|MIN|MINUTO)?)\b", texto_upper):
-        duracion = 60
-    elif re.search(r"\b5\s*(?:S|SEG|SEGUNDOS)?\b", texto_upper):
+    if re.search(r"\b(5\s*(?:S|SEG|SEGUNDOS)?)\b", texto_upper):
         duracion = 5
-    elif re.search(r"\b15\s*(?:S|SEG|SEGUNDOS)?\b", texto_upper):
+    elif re.search(r"\b(15\s*(?:S|SEG|SEGUNDOS)?)\b", texto_upper):
         duracion = 15
-    elif re.search(r"\b30\s*(?:S|SEG|SEGUNDOS)?\b", texto_upper):
+    elif re.search(r"\b(30\s*(?:S|SEG|SEGUNDOS)?)\b", texto_upper):
         duracion = 30
+    elif re.search(r"\b(60\s*(?:S|SEG|SEGUNDOS)?|1\s*(?:M|MIN)?)\b", texto_upper):
+        duracion = 60
 
-    # 2. Extraer activo o par (ej: EURUSD-OTC, GBPUSD, etc.)
-    par_match = re.search(r"\b([A-Z0-9]{2,10}(?:-OTC)?)\b", texto_upper.replace("/", ""))
+    # Extraer activo
+    par_match = re.search(r"\b([A-Z0-9_\-]{2,15})\b", texto_upper.replace("/", ""))
     palabras_reservadas = ["CALL", "PUT", "SUBE", "BAJA", "STATUS", "BLITZ", "60S", "5S", "15S", "30S", "1M"]
     activo = par_match.group(1) if (par_match and par_match.group(1) not in palabras_reservadas) else DEFAULT_ACTIVE
 
     return direccion, activo, duracion
 
-# ================= DISPARADOR FLEXIBLE (BLITZ O 60S) =================
+def disparar_blitz(api, activo, direccion, duracion):
+    """
+    Intenta colocar orden Blitz en la duración solicitada (5s, 15s, 30s).
+    """
+    # 1. Intento por buy_digital_spot con expiración corta
+    try:
+        check, id_trade = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, duracion)
+        if check and id_trade:
+            return True, id_trade, f"Blitz {duracion}s"
+    except Exception as e:
+        print(f"[BLITZ SPOT ERR]: {e}")
+
+    # 2. Intento de orden directa en websocket si es un activo Blitz
+    try:
+        # Algunos pares Blitz en IQ requieren el id específico
+        api.subscribe_strike_list(activo, duracion)
+        time.sleep(0.1)
+        check, id_trade = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, duracion)
+        if check and id_trade:
+            return True, id_trade, f"Blitz {duracion}s"
+    except Exception as e:
+        print(f"[BLITZ SUBSCRIBE ERR]: {e}")
+
+    return False, None, "No Blitz"
+
 def ejecutar_orden(api, activo, direccion, duracion):
-    """
-    Si duracion == 60: ejecuta opción binaria de 1 minuto (o digital 1m).
-    Si duracion in [5, 15, 30]: ejecuta digital_spot en modalidad Blitz ultrarrápida.
-    """
-    if duracion == 60:
-        # Disparo clásico de 60 segundos (Binarias 1 minuto)
-        try:
-            check, id_trade = api.buy(TRADE_AMOUNT, activo, direccion, 1)
-            if check and id_trade:
-                return True, id_trade, "Binaria 60s (1m)"
-        except Exception:
-            pass
+    # Si se pide Blitz explícito (5s, 15s, 30s)
+    if duracion in [5, 15, 30]:
+        ok, res_id, modo = disparar_blitz(api, activo, direccion, duracion)
+        if ok:
+            return True, res_id, modo
+        else:
+            print(f"⚠️ El activo {activo} no aceptó contrato Blitz de {duracion}s. Verificando fallback...")
 
-        # Fallback a Digital 1m si binarias está cerrada
-        try:
-            check, id_trade = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, 1)
-            if check and id_trade:
-                return True, id_trade, "Digital 60s (1m)"
-        except Exception as e:
-            return False, str(e), "Error"
+    # Si es 60s o si Blitz no está disponible en ese par
+    try:
+        check, id_trade = api.buy(TRADE_AMOUNT, activo, direccion, 1)
+        if check and id_trade:
+            return True, id_trade, "Binaria 60s (1m)"
+    except Exception as e:
+        print(f"[BINARIA ERR]: {e}")
 
-    else:
-        # Modo Blitz ultrarrápido (5s, 15s, 30s)
-        try:
-            check, id_trade = api.buy_digital_spot(activo, TRADE_AMOUNT, direccion, duracion)
-            if check and id_trade:
-                return True, id_trade, f"Blitz {duracion}s"
-        except Exception:
-            pass
-
-        # Fallback a 1m si el broker no tiene habilitado Blitz en ese activo en ese momento
-        try:
-            check, id_trade = api.buy(TRADE_AMOUNT, activo, direccion, 1)
-            if check and id_trade:
-                return True, id_trade, "Fallback Binaria 1m"
-        except Exception as e:
-            return False, str(e), "Error"
-
-    return False, "Fallo al colocar orden en IQ Option", "Error"
+    return False, "Activo no disponible en el tiempo seleccionado", "Error"
 
 # ================= BUCLE PRINCIPAL =================
 def main():
     Thread(target=iniciar_servidor_web, daemon=True).start()
 
     if not IQ_USER or not IQ_PASS:
-        print("❌ [FATAL] Credenciales no configuradas.")
+        print("❌ Variables de credenciales no configuradas.")
         return
 
     api = inicializar_iq()
@@ -133,8 +132,7 @@ def main():
         pass
 
     print("\n" + "=" * 55)
-    print("  🚀 ATLEON IQ EJECUTOR DÚO (BLITZ & 60s) ACTIVO 🚀")
-    print(f"  Modo: {IQ_ACCOUNT_TYPE} | Saldo: ${api.get_balance():.2f}")
+    print("  🚀 ATLEON IQ (BLITZ NATIVO + 60s) ACTIVO 🚀")
     print("=" * 55 + "\n")
 
     last_update_id = 0
@@ -142,7 +140,7 @@ def main():
     while True:
         try:
             if not api.check_connect():
-                print("[RECONEXIÓN] Reanudando WebSocket IQ...")
+                print("[RECONEXIÓN] Reconectando socket IQ...")
                 api.connect()
 
             url = f"{TG_API}/getUpdates?offset={last_update_id + 1}&timeout=10"
@@ -166,7 +164,7 @@ def main():
                     saldo = api.get_balance()
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"📊 Atleon IQ Cloud:\n• Estado: 🟢 Conectado\n• Cuenta: {IQ_ACCOUNT_TYPE}\n• Saldo: ${saldo:.2f}\n• Modos: Blitz (5s/15s/30s) y 60s (1m)"
+                        "text": f"📊 Atleon IQ Cloud:\n• Estado: 🟢 Conectado\n• Saldo: ${saldo:.2f}\n• Modalidades: Blitz (5s/15s/30s) y 60s"
                     }, timeout=5)
                     continue
 
@@ -174,24 +172,22 @@ def main():
                 if not direccion:
                     continue
 
-                print(f"⚡ [TRIGGER] {direccion.upper()} | {activo} | Duración: {duracion}s | Monto: ${TRADE_AMOUNT}")
+                print(f"⚡ [DISPARO] {direccion.upper()} | {activo} | {duracion}s | ${TRADE_AMOUNT}")
                 exito, resultado, modo = ejecutar_orden(api, activo, direccion, duracion)
 
                 if exito:
-                    print(f"💥 [TRADE OK] ID: {resultado} ({modo})")
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
                         "text": f"✅ Trade Ejecutado ({modo}):\n• Activo: {activo}\n• Dirección: {direccion.upper()}\n• Tiempo: {duracion}s\n• Monto: ${TRADE_AMOUNT}"
                     }, timeout=5)
                 else:
-                    print(f"⚠️ [FALLO TRADE]: {resultado}")
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"❌ Error en orden {activo} ({duracion}s): {resultado}"
+                        "text": f"❌ Error ejecutando {activo} ({duracion}s): {resultado}"
                     }, timeout=5)
 
         except Exception as e:
-            print(f"[LOOP ERR]: {e}")
+            print(f"[LOOP EXCEPTION]: {e}")
             time.sleep(2)
 
         time.sleep(0.2)

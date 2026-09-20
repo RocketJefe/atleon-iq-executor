@@ -2,7 +2,20 @@ import os
 import time
 import re
 import requests
+from threading import Thread
+from flask import Flask
 from iqoptionapi.api import IQOptionAPI
+
+# ================= SERVIDOR WEB (RENDER FREE TIER) =================
+app = Flask(__name__)
+
+@app.route('/')
+def health_check():
+    return "OK - Atleon IQ Executor Activo", 200
+
+def iniciar_servidor_web():
+    puerto = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=puerto)
 
 # ================= CONFIGURACIÓN =================
 IQ_USER = os.getenv("IQ_USER")
@@ -10,31 +23,28 @@ IQ_PASS = os.getenv("IQ_PASS")
 IQ_ACCOUNT_TYPE = os.getenv("IQ_ACCOUNT_TYPE", "PRACTICE").upper()
 TRADE_AMOUNT = float(os.getenv("TRADE_AMOUNT", "1"))
 DEFAULT_ACTIVE = os.getenv("DEFAULT_ACTIVE", "EURUSD")
-EXPIRATION_TIME = int(os.getenv("EXPIRATION_TIME", "1"))  # En minutos
+EXPIRATION_TIME = int(os.getenv("EXPIRATION_TIME", "1"))
 
-BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "8991225048:AAG6qc-VXNHP2zJ6LhwpHpmgTEZ9wkKzytc")
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ================= CONEXIÓN IQ OPTION =================
 def inicializar_iq():
-    print(f"\n[IQ] Iniciando conexión con usuario: {IQ_USER}...")
+    print(f"\n[IQ] Conectando con {IQ_USER}...")
     api = IQOptionAPI("iqoption.com", IQ_USER, IQ_PASS)
     conectado, motivo = api.connect()
 
     if not conectado:
-        print(f"❌ [ERROR IQ] Falla de autenticación: {motivo}")
+        print(f"❌ [ERROR IQ] Falla: {motivo}")
         return None
 
     api.change_balance(IQ_ACCOUNT_TYPE)
     saldo = api.get_balance()
-    print(f"✅ [IQ CONECTADO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo disponible: ${saldo:.2f}")
+    print(f"✅ [IQ CONECTADO] Cuenta: {IQ_ACCOUNT_TYPE} | Saldo: ${saldo:.2f}")
     return api
 
-# ================= PROCESADOR DE SEÑALES =================
 def extraer_datos_senal(texto):
     texto_upper = texto.upper()
-
-    # Detectar dirección
     es_call = any(k in texto_upper for k in ["COMPRA", "CALL", "SUBE", "HIGHER"])
     es_put = any(k in texto_upper for k in ["VENTA", "PUT", "BAJA", "LOWER"])
     
@@ -42,8 +52,6 @@ def extraer_datos_senal(texto):
         return None, None
 
     direccion = "call" if es_call else "put"
-
-    # Intentar extraer activo si viene en el mensaje (ej: EURUSD, GBPUSD-OTC, etc.)
     par_match = re.search(r"\b([A-Z]{3}/?[A-Z]{3}(?:-OTC)?)\b", texto_upper)
     activo = par_match.group(1).replace("/", "") if par_match else DEFAULT_ACTIVE
 
@@ -51,22 +59,24 @@ def extraer_datos_senal(texto):
 
 # ================= BUCLE PRINCIPAL =================
 def main():
+    # Iniciar servidor HTTP en segundo plano para Render Free
+    Thread(target=iniciar_servidor_web, daemon=True).start()
+
     if not IQ_USER or not IQ_PASS:
-        print("❌ [FATAL] Debes configurar IQ_USER e IQ_PASS en las variables de entorno.")
+        print("❌ [FATAL] Variables IQ_USER e IQ_PASS no configuradas.")
         return
 
     api = inicializar_iq()
     if not api:
         return
 
-    # Limpiar webhooks previos de Telegram
     try:
         requests.get(f"{TG_API}/deleteWebhook?drop_pending_updates=True", timeout=5)
     except Exception:
         pass
 
     print("\n" + "=" * 55)
-    print("  🚀 ATLEON IQ-CLOUD EXECUTOR EN LÍNEA (RENDER) 🚀")
+    print("  🚀 ATLEON IQ EXECUTOR ACTIVO EN RENDER (GRATIS) 🚀")
     print(f"  Modo: {IQ_ACCOUNT_TYPE} | Monto base: ${TRADE_AMOUNT}")
     print("=" * 55 + "\n")
 
@@ -74,12 +84,10 @@ def main():
 
     while True:
         try:
-            # Revalidar conexión de socket
             if not api.check_connect():
                 print("[RECONEXIÓN] Reconectando sesión de IQ Option...")
                 api.connect()
 
-            # Polling a Telegram
             url = f"{TG_API}/getUpdates?offset={last_update_id + 1}&timeout=10"
             res = requests.get(url, timeout=15).json()
 
@@ -97,7 +105,6 @@ def main():
                 texto = msg["text"].strip()
                 print(f"\n[TELEGRAM RECIBIDO]: {texto}")
 
-                # Comando /status
                 if texto.upper().startswith("/STATUS"):
                     saldo = api.get_balance()
                     requests.post(f"{TG_API}/sendMessage", json={
@@ -106,21 +113,18 @@ def main():
                     }, timeout=5)
                     continue
 
-                # Parsear señal
                 direccion, activo = extraer_datos_senal(texto)
                 if not direccion:
                     continue
 
-                print(f"⚡ [DISPARO] Enviando orden {direccion.upper()} en {activo} por ${TRADE_AMOUNT}...")
-
-                # Ejecución de opción binaria
+                print(f"⚡ [DISPARO] Orden {direccion.upper()} en {activo} (${TRADE_AMOUNT})...")
                 exito, resultado = api.buy(TRADE_AMOUNT, activo, direccion, EXPIRATION_TIME)
 
                 if exito:
-                    print(f"💥 [ORDEN EXITOSA] ID Trade: {resultado}")
+                    print(f"💥 [ORDEN EXITOSA] ID: {resultado}")
                     requests.post(f"{TG_API}/sendMessage", json={
                         "chat_id": chat_id,
-                        "text": f"✅ Trade ejecutado en IQ Option:\n• Activo: {activo}\n• Tipo: {direccion.upper()}\n• Monto: ${TRADE_AMOUNT}\n• Expiración: {EXPIRATION_TIME}m"
+                        "text": f"✅ Trade IQ Option Ejecutado:\n• Activo: {activo}\n• Tipo: {direccion.upper()}\n• Monto: ${TRADE_AMOUNT}\n• Expiración: {EXPIRATION_TIME}m"
                     }, timeout=5)
                 else:
                     print(f"⚠️ [FALLO DE EJECUCIÓN]: {resultado}")
